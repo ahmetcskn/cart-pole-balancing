@@ -35,3 +35,17 @@ target_link_libraries(
     GLUT::GLUT
 )
 
+# Importable Python module sharing the original physics and GLFW drawing.
+set_target_properties(stick_balance_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
+find_package(pybind11 CONFIG REQUIRED)
+pybind11_add_module(stick_physics src/python_bridge.cpp src/viewer.cpp)
+target_compile_definitions(stick_physics PRIVATE STICK_VIEWER_LIBRARY)
+target_link_libraries(stick_physics PRIVATE stick_balance_core glfw OpenGL::GL GLUT::GLUT)
+set_target_properties(stick_physics PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+    LIBRARY_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}"
+    LIBRARY_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}"
+    LIBRARY_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}"
+    LIBRARY_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_BINARY_DIR}"
+)

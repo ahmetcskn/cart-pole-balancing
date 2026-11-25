@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""PyTorch PPO, existing C++ physics, and a live training viewer.
+
+python3 train.py                      # watch every training episode
+python3 train.py --speed 20            # accelerate the same training episodes
+python3 train.py --headless --steps 200000
+python3 train.py --play                # watch the saved policy
+python3 train.py --task swingup        # learn from the original theta=0.8 reset
+python3 train.py --self-test           # check C++ bridge and physics consistency
+
+Only this project receives generated files: .rl_build/ and rl_runs/.
+No downloads, dependency installation, or modification of existing sources.
+Dependencies: Python 3, PyTorch, NumPy, Tkinter, and a C++17 compiler.
+"""
+from pathlib import Path
+import argparse
+import ctypes as ct
+import csv
+import math
+import os
+import random
+import subprocess
+import time
+
+import numpy as np
+import torch
+from torch import nn
+from torch.distributions import Normal
+
+ROOT = Path(__file__).resolve().parent
+DT = 0.04  # four existing 0.01-second C++ steps per policy decision
+LIMIT = 4.0
+HORIZON = 500  # 20 simulated seconds
+FORCE = 30.0  # Only horizontal cart force; pendulum torque is always zero.
+
+BRIDGE = r'''
+#include "cart_pole.hpp"
+extern "C" {
+void* cp_create() { return new CartPole(); }
+void cp_destroy(void* p) { delete static_cast<CartPole*>(p); }
+void cp_reset(void* p, double x, double v, double theta, double omega) {
+    auto& sim = *static_cast<CartPole*>(p);
+    sim.reset();
+    // The underlying object is mutable; only its public reference is const.
+    // This adapter adds reset-state control without editing the user's header.
+    auto& s = const_cast<CartPoleState&>(sim.state());
+    s.x = x; s.velocity = v; s.theta = theta; s.omega = omega;
+}
+void cp_step(void* p, double force) {
+    static_cast<CartPole*>(p)->step(force, 0.0);
+}
+void cp_state(void* p, double* out) {
+    const auto& s = static_cast<CartPole*>(p)->state();
+    out[0] = s.x; out[1] = s.velocity; out[2] = s.theta; out[3] = s.omega;
+}
+double cp_dt(void* p) { return static_cast<CartPole*>(p)->parameters().dt; }
+double cp_length(void* p) { return static_cast<CartPole*>(p)->parameters().length; }
+}
+'''
+
+
+def load_bridge():
+    folder = ROOT / '.rl_build'
+    folder.mkdir(exist_ok=True)
+    source, library = folder / 'bridge.cpp', folder / 'libstick_rl.so'
+    if not source.exists() or source.read_text() != BRIDGE:
+        source.write_text(BRIDGE)
+    inputs = [source, ROOT / 'src/cart_pole.cpp', ROOT / 'include/cart_pole.hpp']
+    if not library.exists() or any(p.stat().st_mtime > library.stat().st_mtime for p in inputs):
+        print('C++ fizik bağlantısı derleniyor...', flush=True)
+        subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++17', '-O3', '-shared',
+                        '-fPIC', '-I', str(ROOT / 'include'), str(source),
+                        str(ROOT / 'src/cart_pole.cpp'), '-o', str(library)], check=True,
+                       cwd=ROOT)
+    lib = ct.CDLL(str(library))
+    lib.cp_create.argtypes, lib.cp_create.restype = [], ct.c_void_p
+    for name, args in [('cp_destroy', [ct.c_void_p]),
+                       ('cp_reset', [ct.c_void_p] + [ct.c_double] * 4),
+                       ('cp_step', [ct.c_void_p, ct.c_double]),
+                       ('cp_state', [ct.c_void_p, ct.POINTER(ct.c_double)])]:
+        fn = getattr(lib, name)
+        fn.argtypes, fn.restype = args, None
+    for name in ['cp_dt', 'cp_length']:
+        fn = getattr(lib, name)
+        fn.argtypes, fn.restype = [ct.c_void_p], ct.c_double
+    return lib
+
+
+class Environment:
+    def __init__(self, lib, task, seed):
+        self.lib, self.task = lib, task
+        self.ptr = lib.cp_create()
+        self.rng = np.random.default_rng(seed)
+        self.buffer = (ct.c_double * 4)()
+        self.substeps = round(DT / lib.cp_dt(self.ptr))
+        if self.substeps < 1 or not math.isclose(self.substeps * lib.cp_dt(self.ptr), DT):
+            raise ValueError('C++ dt, kontrol aralığı 0.04 ile uyumlu olmalı.')
+        self.length = lib.cp_length(self.ptr)
+        self.count = 0
+
+    def close(self):
+        if self.ptr:
+            self.lib.cp_destroy(self.ptr)
+            self.ptr = None
+
+    def state(self):
+        self.lib.cp_state(self.ptr, self.buffer)
+        return np.array(self.buffer, dtype=np.float64)
+
+    def observe(self):
+        x, v, theta, omega = self.state()
+        return np.array([x / LIMIT, v / 5, math.sin(theta), math.cos(theta), omega / 8], dtype=np.float32)
+
+    def reset(self):
+        # Balance starts close to the unstable upright equilibrium.
+        # Swingup keeps the original reset angle and adds a small random perturbation.
+        theta = (math.pi if self.task == 'balance' else 0.8) + self.rng.uniform(-0.18, 0.18)
+        self.lib.cp_reset(self.ptr, self.rng.uniform(-0.15, 0.15),
+                          self.rng.uniform(-0.1, 0.1), theta, self.rng.uniform(-0.1, 0.1))
+        self.count = 0
+        return self.observe()
+
+    def step(self, action):
+        action = np.clip(action, -1, 1)
+        for _ in range(self.substeps):
+            self.lib.cp_step(self.ptr, float(action[0] * FORCE))
+        self.count += 1
+        s = self.state()
+        if not np.isfinite(s).all():
+            raise FloatingPointError('C++ simülasyonunda sonlu olmayan durum oluştu.')
+        x, v, theta, omega = s
+        error = math.atan2(math.sin(theta - math.pi), math.cos(theta - math.pi))
+        effort = float(np.square(action).mean())
+        if self.task == 'balance':
+            reward = 1 - (error / 0.7) ** 2 - 0.1 * (x / LIMIT) ** 2 - 0.01 * effort - 0.001 * v ** 2
+        else:
+            reward = (1 - math.cos(theta)) / 2 - 0.1 * (x / LIMIT) ** 2 - 0.002 * omega ** 2 - 0.01 * effort
+        reason = 'ray sınırı' if abs(x) > LIMIT else ''
+        if self.task == 'balance' and abs(error) > 0.7:
+            reason = 'çubuk düştü'
+        terminated = bool(reason)
+        if terminated:
+            reward -= 5.0
+        truncated = self.count >= HORIZON and not terminated
+        return self.observe(), reward, terminated, truncated, reason or ('süre tamamlandı' if truncated else '')
+
+
+class Policy(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.actor = nn.Sequential(nn.Linear(5, 64), nn.Tanh(), nn.Linear(64, 64), nn.Tanh(), nn.Linear(64, 1))
+        self.critic = nn.Sequential(nn.Linear(5, 64), nn.Tanh(), nn.Linear(64, 64), nn.Tanh(), nn.Linear(64, 1))
+        self.log_std = nn.Parameter(torch.full((1,), -0.5))
+        for layer in self.modules():
+            if isinstance(layer, nn.Linear):
+                nn.init.orthogonal_(layer.weight, math.sqrt(2))
+                nn.init.zeros_(layer.bias)
+        nn.init.orthogonal_(self.actor[-1].weight, 0.01)
+        nn.init.orthogonal_(self.critic[-1].weight, 1.0)
+
+    def distribution(self, obs):
+        return Normal(self.actor(obs), self.log_std.clamp(-3, 1).exp())
+
+    def value(self, obs):
+        return self.critic(obs).squeeze(-1)
+
+
+class Viewer:
+    def __init__(self, speed):
+        import tkinter as tk
+        self.tk = tk
+        self.root = tk.Tk()
+        self.root.title('Stick — PyTorch PPO eğitimi')
+        self.root.geometry('1000x720')
+        self.canvas = tk.Canvas(self.root, bg='#101827', highlightthickness=0)
+        self.canvas.pack(fill='both', expand=True)
+        controls = tk.Frame(self.root)
+        controls.pack(fill='x')
+        self.paused = False
+        self.closed = False
+        tk.Button(controls, text='Duraklat / Devam', command=self.toggle).pack(side='left')
+        self.speed = tk.DoubleVar(value=speed)
+        tk.Label(controls, text='Hız').pack(side='left')
+        tk.Scale(controls, variable=self.speed, from_=0.5, to=30, resolution=0.5,
+                 orient='horizontal', length=300).pack(side='left')
+        tk.Label(controls, text='Pencereyi kapat: modeli kaydet ve bitir').pack(side='right')
+        self.root.protocol('WM_DELETE_WINDOW', self.close)
+        self.history = []
+        self.last = time.monotonic()
+
+    def toggle(self):
+        self.paused = not self.paused
+
+    def close(self):
+        self.closed = True
+        self.root.destroy()
+
+    def pump(self):
+        if self.closed:
+            raise KeyboardInterrupt
+        self.root.update()
+        if self.closed:
+            raise KeyboardInterrupt
+
+    def draw(self, env, episode, steps, total, reward, action, status):
+        self.pump()
+        while self.paused:
+            self.pump()
+            time.sleep(0.02)
+        c = self.canvas
+        c.delete('all')
+        w, h = max(c.winfo_width(), 800), max(c.winfo_height(), 600)
+        scale = min(w / 12, (h - 230) / 6)
+        cx, cy = w / 2, 290
+        x, v, theta, omega = env.state()
+        px, py = cx + x * scale, cy
+        bx, by = px + env.length * math.sin(theta) * scale, py + env.length * math.cos(theta) * scale
+        c.create_text(24, 25, anchor='nw', text='STICK / PPO + C++', fill='#67e8f9', font=('Sans', 20, 'bold'))
+        mean = np.mean(self.history[-20:]) if self.history else 0
+        text = (f'Deneme {episode}    Eğitim adımı {steps:,}    Süre {env.count * DT:.2f} / {HORIZON * DT:.0f} s\n'
+                f'Toplam ödül {total:.2f}    Son ödül {reward:+.3f}    Son 20 ort. {mean:.2f}\n'
+                f'Yatay kuvvet {action[0] * FORCE:+.2f} N    {status}')
+        c.create_text(24, 67, anchor='nw', text=text, fill='#e2e8f0', font=('Sans', 12))
+        c.create_line(cx - LIMIT * scale, cy, cx + LIMIT * scale, cy, fill='#64748b', width=2)
+        for sign in [-1, 1]:
+            edge = cx + sign * LIMIT * scale
+            c.create_line(edge, cy - 20, edge, cy + 20, fill='#fb7185', width=3)
+        c.create_rectangle(px - 18, py - 10, px + 18, py + 10, fill='#67e8f9', outline='')
+        c.create_line(px, py, bx, by, fill='#f8fafc', width=5)
+        c.create_oval(bx - 9, by - 9, bx + 9, by + 9, fill='#fbbf24', outline='')
+        c.create_text(24, h - 135, anchor='nw', text='Deneme ödülleri (son 100)', fill='#94a3b8')
+        values = self.history[-100:]
+        if len(values) > 1:
+            lo, hi = min(values), max(values)
+            points = []
+            for i, value in enumerate(values):
+                points.extend([30 + i * (w - 60) / (len(values) - 1), h - 25 - (value - lo) / max(hi - lo, 1) * 85])
+            c.create_line(*points, fill='#34d399', width=2)
+        self.pump()
+        deadline = self.last + DT / self.speed.get()
+        while time.monotonic() < deadline:
+            self.pump()
+            time.sleep(min(0.005, max(0, deadline - time.monotonic())))
+        self.last = time.monotonic()
+
+
+def update(model, optimizer, batch):
+    obs, latent, old_logp, returns, advantages = [torch.as_tensor(np.asarray(x), dtype=torch.float32) for x in batch]
+    advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+    for _ in range(10):
+        for ids in torch.randperm(len(obs)).split(128):
+            dist = model.distribution(obs[ids])
+            logp = dist.log_prob(latent[ids]).sum(-1)
+            # Latent Gaussian log ratios are also the tanh-action log ratios:
+            # the fixed transform's Jacobian cancels between old and new policies.
+            ratio = (logp - old_logp[ids]).exp()
+            adv = advantages[ids]
+            actor_loss = -torch.minimum(ratio * adv, ratio.clamp(0.8, 1.2) * adv).mean()
+            value_loss = (model.value(obs[ids]) - returns[ids]).square().mean()
+            loss = actor_loss + 0.5 * value_loss - 0.001 * dist.entropy().sum(-1).mean()
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+            optimizer.step()
+
+
+def evaluate(lib, model, task, seed, episodes=10):
+    env = Environment(lib, task, seed)
+    totals, durations = [], []
+    try:
+        for _ in range(episodes):
+            obs, total = env.reset(), 0
+            for _ in range(HORIZON):
+                with torch.no_grad():
+                    action = model.actor(torch.from_numpy(obs)).tanh().numpy()
+                obs, reward, term, trunc, _ = env.step(action)
+                total += reward
+                if term or trunc:
+                    break
+            totals.append(total)
+            durations.append(env.count * DT)
+    finally:
+        env.close()
+    return float(np.mean(totals)), float(np.mean(durations))
+
+
+def self_test(lib):
+    env = Environment(lib, 'balance', 1)
+    try:
+        policy = Policy()
+        assert policy.actor(torch.zeros(5)).shape == (1,)
+        assert policy.distribution(torch.zeros(5)).sample().shape == (1,)
+        lib.cp_reset(env.ptr, 0, 0, 0.8, 0)
+        theta, force = 0.8, 2.0
+        a11, a12, a21, a22 = 2.5, math.cos(theta), 0.25 * math.cos(theta), 1.1
+        b1, b2 = -9.81 * math.sin(theta), force
+        det = a11 * a22 - a12 * a21
+        alpha, accel = (b1 * a22 - b2 * a12) / det, (a11 * b2 - b1 * a21) / det
+        lib.cp_step(env.ptr, force)
+        np.testing.assert_allclose(env.state(), [accel * .0001, accel * .01, theta + alpha * .0001, alpha * .01], atol=1e-12)
+        lib.cp_reset(env.ptr, 0, 0, math.pi, 0)
+        _, r, term, trunc, _ = env.step(np.zeros(1))
+        assert r > .99 and not term and not trunc
+        lib.cp_reset(env.ptr, 4.1, 0, math.pi, 0)
+        assert env.step(np.zeros(1))[2]
+        lib.cp_reset(env.ptr, 0, 0, math.pi, 0)
+        env.count = HORIZON - 1
+        _, _, term, trunc, _ = env.step(np.zeros(1))
+        assert trunc and not term
+        lib.cp_reset(env.ptr, 0, 0, math.pi + .8, 0)
+        assert env.step(np.zeros(1))[2]
+        print('OK: C++ adımı, durum aktarımı, dik konum ödülü, düşme/ray cezası ve zaman sınırı.')
+    finally:
+        env.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--task', choices=['balance', 'swingup'], default='balance')
+    parser.add_argument('--steps', type=int, default=200000)
+    parser.add_argument('--seed', type=int, default=7)
+    parser.add_argument('--speed', type=float, default=4.0)
+    parser.add_argument('--headless', action='store_true')
+    parser.add_argument('--play', action='store_true')
+    parser.add_argument('--self-test', action='store_true')
+    args = parser.parse_args()
+    if args.steps < 1 or not .5 <= args.speed <= 30:
+        parser.error('--steps pozitif, --speed 0.5 ile 30 arasında olmalı.')
+    torch.set_num_threads(1)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+    lib = load_bridge()
+    if args.self_test:
+        self_test(lib)
+        return
+    model = Policy()
+    run_dir = ROOT / 'rl_runs' / args.task
+    checkpoint = run_dir / 'policy.pt'
+    if args.play:
+        if not checkpoint.exists():
+            parser.error(f'Önce eğitim gerekli: {checkpoint}')
+        payload = torch.load(checkpoint, map_location='cpu', weights_only=True)
+        model.load_state_dict(payload['model'])
+    if args.play and args.headless:
+        score, duration = evaluate(lib, model, args.task, args.seed + 10000)
+        print(f'10 bağımsız deneme: ort. ödül={score:.2f}, ort. süre={duration:.2f}s')
+        return
+    viewer = None
+    if not args.headless:
+        try:
+            viewer = Viewer(args.speed)
+        except Exception as exc:
+            parser.exit(1, f'Görüntü penceresi açılamadı: {exc}\nEkransız eğitim: python3 train.py --headless\n')
+    env = Environment(lib, args.task, args.seed)
+    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+    steps, episode, total = 0, 1, 0.0
+    obs = env.reset()
+    output = None
+    try:
+        if not args.play:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            output = (run_dir / f'training-{time.time_ns()}.csv').open('w', newline='')
+            log = csv.writer(output)
+            log.writerow(['episode', 'step', 'return', 'seconds', 'end_reason'])
+            score, duration = evaluate(lib, model, args.task, args.seed + 10000)
+            print(f'Eğitim öncesi: ödül={score:.2f}, süre={duration:.2f}s', flush=True)
+        while args.play or steps < args.steps:
+            observations, actions, logps, values, rewards, next_values, boundaries = [], [], [], [], [], [], []
+            for _ in range(1024 if args.play else min(1024, args.steps - steps)):
+                with torch.no_grad():
+                    tensor = torch.from_numpy(obs)
+                    dist = model.distribution(tensor)
+                    latent = dist.mean if args.play else dist.sample()
+                    action = latent.tanh().numpy()
+                    value, logp = model.value(tensor).item(), dist.log_prob(latent).sum().item()
+                next_obs, reward, term, trunc, reason = env.step(action)
+                with torch.no_grad():
+                    next_value = 0.0 if term else model.value(torch.from_numpy(next_obs)).item()
+                observations.append(obs)
+                actions.append(latent.numpy())
+                logps.append(logp)
+                values.append(value)
+                rewards.append(reward)
+                next_values.append(next_value)
+                boundaries.append(term or trunc)
+                steps += 1
+                total += reward
+                if viewer:
+                    viewer.draw(env, episode, steps, total, reward, action, reason or ('model oynuyor' if args.play else 'öğreniyor'))
+                obs = next_obs
+                if term or trunc:
+                    print(f'Deneme {episode:5d} | adım {steps:7d} | ödül {total:8.2f} | {env.count * DT:5.2f}s | {reason}', flush=True)
+                    if output:
+                        log.writerow([episode, steps, total, env.count * DT, reason])
+                        output.flush()
+                    if viewer:
+                        viewer.history.append(total)
+                        deadline = time.monotonic() + .3 / max(1, viewer.speed.get() / 4)
+                        while time.monotonic() < deadline:
+                            viewer.pump()
+                            time.sleep(.01)
+                    obs, total, episode = env.reset(), 0.0, episode + 1
+            if not args.play:
+                advantages, gae = np.zeros(len(rewards), dtype=np.float32), 0.0
+                for i in reversed(range(len(rewards))):
+                    delta = rewards[i] + .99 * next_values[i] - values[i]
+                    # Time limits bootstrap value, but GAE never crosses a reset.
+                    gae = delta + .99 * .95 * (not boundaries[i]) * gae
+                    advantages[i] = gae
+                update(model, optimizer, [observations, actions, logps, advantages + np.asarray(values), advantages])
+                save(model, optimizer, checkpoint, args, steps)
+                if viewer:
+                    viewer.pump()
+    except KeyboardInterrupt:
+        print('\nDurduruldu.', flush=True)
+    finally:
+        if not args.play:
+            save(model, optimizer, checkpoint, args, steps)
+            print(f'Model kaydedildi: {checkpoint}', flush=True)
+        if output:
+            output.close()
+        env.close()
+        if viewer and not viewer.closed:
+            viewer.close()
+    if not args.play:
+        score, duration = evaluate(lib, model, args.task, args.seed + 10000)
+        print(f'Eğitim sonrası (10 ayrı deneme): ödül={score:.2f}, süre={duration:.2f}s', flush=True)
+
+
+def save(model, optimizer, path, args, steps):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix('.tmp')
+    torch.save({'model': model.state_dict(), 'optimizer': optimizer.state_dict(),
+                'task': args.task, 'seed': args.seed, 'steps': steps,
+                'force_limit': FORCE, 'action_space': 'horizontal_force_only', 'control_dt': DT}, temporary)
+    temporary.replace(path)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/stick_balance.dir/link.d CMakeFiles/stick_balance.dir/src/viewer.cpp.o -o stick_balance  libstick_balance_core.a /usr/lib/libglfw.so.3.5 /usr/lib/libglut.so /usr/lib/libGLX.so /usr/lib/libOpenGL.so /usr/lib/libXmu.so /usr/lib/libXi.so

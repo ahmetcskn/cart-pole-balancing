@@ -7,6 +7,10 @@ void CartPole::reset() {
     state_ = CartPoleState{};
 }
 
+void CartPole::reset(const CartPoleState& initial_state) {
+    state_ = initial_state;
+}
+
 const CartPoleState& CartPole::state() const {
     return state_;
 }

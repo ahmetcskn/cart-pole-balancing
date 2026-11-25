@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -O3 -DNDEBUG -shared -Wl,--dependency-file=CMakeFiles/stick_rl.dir/link.d -Wl,-soname,libstick_rl.so -o libstick_rl.so CMakeFiles/stick_rl.dir/src/python_bridge.cpp.o  libstick_balance_core.a

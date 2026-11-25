@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/ahmet/workspace/03_playground/stick/.rl_build/pybind11/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

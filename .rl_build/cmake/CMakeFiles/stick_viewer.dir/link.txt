@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -O3 -DNDEBUG -shared -Wl,--dependency-file=CMakeFiles/stick_viewer.dir/link.d -Wl,-soname,libstick_viewer.so -o libstick_viewer.so CMakeFiles/stick_viewer.dir/src/viewer.cpp.o  libstick_balance_core.a /usr/lib/libglfw.so.3.5 /usr/lib/libglut.so /usr/lib/libGLX.so /usr/lib/libOpenGL.so /usr/lib/libXmu.so /usr/lib/libXi.so

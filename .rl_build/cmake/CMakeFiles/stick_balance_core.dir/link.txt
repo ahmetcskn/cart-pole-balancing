@@ -1,0 +1,2 @@
+/usr/bin/ar qc libstick_balance_core.a CMakeFiles/stick_balance_core.dir/src/cart_pole.cpp.o
+/usr/bin/ranlib libstick_balance_core.a
