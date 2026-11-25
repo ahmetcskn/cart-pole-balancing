@@ -1,4 +1,4 @@
-# Stick Balance
+# Cart-Pole Balancing
 
 A C++ cart-pole simulation with PyTorch reinforcement learning. The model learns to balance the pole by moving the cart along the x-axis. The RL controller applies no torque.
 
